@@ -242,7 +242,7 @@ _is_real_cert() {
     [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]
 }
 
-# 确保 Nginx HTTPS 监听存在 (偷自己域名模式，供 Reality dest 回落)
+# 确保 Nginx HTTPS 监听存在 (真实域名模式，供 Reality dest 回落)
 # 用法: _ensure_nginx_https_for_reality "domain.com"
 _ensure_nginx_https_for_reality() {
     local domain="$1"
@@ -273,7 +273,7 @@ _ensure_nginx_https_for_reality() {
     
     # 生成 HTTPS 配置 (供 Reality dest 回落)
     cat > "$nginx_conf" << EOF
-# Reality 回落后端 (偷自己域名模式) - 供 Reality dest 使用
+# Reality 回落后端 (真实域名模式) - 供 Reality dest 使用
 # 此配置由脚本自动生成，请勿手动修改
 server {
     listen 127.0.0.1:${nginx_https_port} ssl http2;
@@ -884,24 +884,18 @@ add_xray_inbound_v2() {
     local inbound_json=""
     local tmp_inbound=$(mktemp)
     
-    # 检测是否使用真实证书偷自己域名 (Reality 需要特殊处理 dest)
+    # 检测是否使用真实证书 (Reality 需要特殊处理 dest)
     local reality_dest="${sni}:443"
     local cert_domain=""
     [[ -f "$CFG/cert_domain" ]] && cert_domain=$(cat "$CFG/cert_domain")
     
     # 如果 SNI 等于证书域名，且有真实证书，则 dest 指向本地 Nginx HTTPS
-    if [[ -n "$cert_domain" && "$sni" == "$cert_domain" && -f "$CFG/certs/server.crt" ]]; then
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || \
-           [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || \
-           [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
-            # 真实证书 + 偷自己域名，dest 必须指向本地 Nginx HTTPS (固定 8443)
-            # 注意：sub.info 的 sub_port 可能是 HTTP 80，不能用于 Reality dest
-            reality_dest="127.0.0.1:8443"
-            
-            # 确保 Nginx HTTPS 监听存在 (偷自己域名模式)
-            _ensure_nginx_https_for_reality "$cert_domain"
-        fi
+    if [[ -n "$cert_domain" && "$sni" == "$cert_domain" ]] && _is_real_cert; then
+        # 真实证书模式，dest 必须指向本地 Nginx HTTPS (固定 8443)
+        reality_dest="127.0.0.1:8443"
+        
+        # 确保 Nginx HTTPS 监听存在 (真实域名模式)
+        _ensure_nginx_https_for_reality "$cert_domain"
     fi
     
     case "$protocol" in
@@ -1118,22 +1112,55 @@ add_xray_inbound_v2() {
             }' > "$tmp_inbound"
             ;;
         socks)
-            jq -n \
-                --argjson port "$port" \
-                --arg username "$username" \
-                --arg password "$password" \
-            '{
-                port: $port,
-                listen: "::",
-                protocol: "socks",
-                settings: {
-                    auth: "password",
-                    accounts: [{user: $username, pass: $password}],
-                    udp: true,
-                    ip: "::"
-                },
-                tag: "socks5"
-            }' > "$tmp_inbound"
+            local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
+            local sni=$(echo "$cfg" | jq -r '.sni // ""')
+            
+            if [[ "$use_tls" == "true" ]]; then
+                # SOCKS5 + TLS
+                jq -n \
+                    --argjson port "$port" \
+                    --arg username "$username" \
+                    --arg password "$password" \
+                    --arg cert "$CFG/certs/server.crt" \
+                    --arg key "$CFG/certs/server.key" \
+                '{
+                    port: $port,
+                    listen: "::",
+                    protocol: "socks",
+                    settings: {
+                        auth: "password",
+                        accounts: [{user: $username, pass: $password}],
+                        udp: true,
+                        ip: "::"
+                    },
+                    streamSettings: {
+                        network: "tcp",
+                        security: "tls",
+                        tlsSettings: {
+                            certificates: [{certificateFile: $cert, keyFile: $key}]
+                        }
+                    },
+                    tag: "socks5"
+                }' > "$tmp_inbound"
+            else
+                # SOCKS5 无 TLS
+                jq -n \
+                    --argjson port "$port" \
+                    --arg username "$username" \
+                    --arg password "$password" \
+                '{
+                    port: $port,
+                    listen: "::",
+                    protocol: "socks",
+                    settings: {
+                        auth: "password",
+                        accounts: [{user: $username, pass: $password}],
+                        udp: true,
+                        ip: "::"
+                    },
+                    tag: "socks5"
+                }' > "$tmp_inbound"
+            fi
             ;;
         ss2022|ss-legacy)
             jq -n \
@@ -1909,18 +1936,13 @@ EOF
             nginx_listen="[::]:$nginx_port"
             nginx_comment="独立提供订阅服务 (HTTP)，不与Reality冲突"
             
-            # 检测是否使用真实证书偷自己域名
-            local is_self_steal=false
-            if [[ "$domain" == "$(cat "$CFG/cert_domain" 2>/dev/null)" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || \
-                   [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || \
-                   [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
-                    is_self_steal=true
-                    # 偷自己域名：回落和外部访问用同一个 HTTPS 端口
-                    nginx_port="${custom_nginx_port:-8443}"
-                    nginx_ssl="ssl"
-                fi
+            # 检测是否使用真实证书 (真实域名模式)
+            local is_real_domain=false
+            if [[ "$domain" == "$(cat "$CFG/cert_domain" 2>/dev/null)" ]] && _is_real_cert; then
+                is_real_domain=true
+                # 真实域名模式：回落和外部访问用同一个 HTTPS 端口
+                nginx_port="${custom_nginx_port:-8443}"
+                nginx_ssl="ssl"
             fi
         elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
             # 证书协议：Nginx 同时监听 80 (fallback) 和自定义端口 (HTTPS订阅)
@@ -1932,7 +1954,7 @@ EOF
         
         # 配置Nginx
         # TLS协议：双端口配置 (80回落 + 外部HTTPS)
-        # Reality偷自己域名：单端口 HTTPS (同时作为回落和外部访问)
+        # Reality真实域名模式：单端口 HTTPS (同时作为回落和外部访问)
         if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
             cat > "$nginx_conf_file" << EOF
 # Fallback 后端 (供 Xray 回落使用)
@@ -1996,12 +2018,12 @@ server {
     server_tokens off;
 }
 EOF
-        elif [[ "$is_self_steal" == "true" ]]; then
-            # Reality偷自己域名：
+        elif [[ "$is_real_domain" == "true" ]]; then
+            # Reality真实域名模式：
             # - 127.0.0.1:nginx_port 供 Reality dest 回落（只显示伪装网页，无订阅）
             # - 0.0.0.0:nginx_port 供外部直接访问（伪装网页 + 订阅服务）
             cat > "$nginx_conf_file" << EOF
-# Reality 回落后端 (偷自己域名模式) - 只显示伪装网页
+# Reality 回落后端 (真实域名模式) - 只显示伪装网页
 server {
     listen 127.0.0.1:$nginx_port ssl http2;
     server_name $domain;
@@ -2073,7 +2095,7 @@ server {
 }
 EOF
         else
-            # Reality偷别人域名：单端口 HTTP 配置
+            # Reality无域名模式：单端口 HTTP 配置
             cat > "$nginx_conf_file" << EOF
 server {
     listen $nginx_listen;  # $nginx_comment
@@ -2158,8 +2180,8 @@ EOF
             if [[ "$nginx_running" == "true" && "$port_listening" == "true" ]]; then
                 _ok "伪装网页已创建并启动"
                 _ok "Web服务器运行正常，订阅链接可用"
-                # Reality 偷自己域名时，显示 Reality 端口
-                if [[ "$is_self_steal" == "true" ]]; then
+                # Reality 真实域名模式时，显示 Reality 端口
+                if [[ "$is_real_domain" == "true" ]]; then
                     local reality_port=$(db_get_field "xray" "vless" "port")
                     [[ -z "$reality_port" ]] && reality_port=$(db_get_field "xray" "vless-xhttp" "port")
                     if [[ -n "$reality_port" ]]; then
@@ -2188,8 +2210,8 @@ EOF
         # 保存订阅配置信息
         local sub_uuid=$(get_sub_uuid)
         local use_https="false"
-        # TLS协议 或 Reality偷自己域名 用 HTTPS
-        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]] || [[ "$is_self_steal" == "true" ]]; then
+        # TLS协议 或 Reality真实域名模式 用 HTTPS
+        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]] || [[ "$is_real_domain" == "true" ]]; then
             use_https="true"
         fi
         
@@ -3033,21 +3055,21 @@ setup_cert_and_nginx() {
                     return 0
                 fi
                 
-                # Reality 协议：询问用户是否使用真实证书（偷自己域名）
+                # Reality 协议：询问用户是否使用现有证书
                 if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
                     echo ""
                     _ok "检测到现有证书: $CERT_DOMAIN"
                     echo ""
                     echo -e "  ${Y}Reality 协议可选择:${NC}"
-                    echo -e "  ${G}1)${NC} 使用真实证书 (偷自己域名，支持订阅服务)"
-                    echo -e "  ${G}2)${NC} 不使用证书 (偷别人域名，更隐蔽)"
+                    echo -e "  ${G}1)${NC} 使用真实域名 (使用现有证书，支持订阅服务)"
+                    echo -e "  ${G}2)${NC} 无域名模式 (使用随机 SNI，更隐蔽)"
                     echo ""
                     read -rp "  请选择 [1]: " reality_cert_choice
                     
                     if [[ "$reality_cert_choice" == "2" ]]; then
-                        # 用户选择不使用证书，清除证书域名变量
+                        # 用户选择无域名模式，清除证书域名变量
                         CERT_DOMAIN=""
-                        _info "将使用随机 SNI 偷别人域名"
+                        _info "将使用随机 SNI (无域名模式)"
                         return 0
                     fi
                     # 继续使用真实证书
@@ -3058,7 +3080,7 @@ setup_cert_and_nginx() {
                     source "$CFG/sub.info" 2>/dev/null
                     NGINX_PORT="${sub_port:-$default_nginx_port}"
                     
-                    # Reality 协议偷自己域名时，必须用 HTTPS 端口，不能用 80
+                    # Reality 协议使用真实域名时，必须用 HTTPS 端口，不能用 80
                     if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
                         if [[ "$NGINX_PORT" == "80" ]]; then
                             NGINX_PORT="$default_nginx_port"
@@ -4194,11 +4216,18 @@ gen_self_cert() {
     
     # 检查是否应该保护现有证书
     if [[ -f "$CFG/certs/server.crt" ]]; then
-        [[ -f "$CFG/cert_domain" ]] && { _ok "检测到已申请的证书，跳过"; return 0; }
-        # 检查是否为 CA 签发的证书
+        # 检查是否为 CA 签发的证书（真实证书不覆盖）
         local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign) ]] && \
-            { _ok "检测到 CA 证书，跳过"; return 0; }
+        if [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign) ]]; then
+            _ok "检测到 CA 证书，跳过"
+            return 0
+        fi
+        # 检查现有自签证书的 CN 是否匹配
+        local current_cn=$(openssl x509 -in "$CFG/certs/server.crt" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
+        if [[ "$current_cn" == "$domain" ]]; then
+            _ok "自签证书 CN 匹配，跳过"
+            return 0
+        fi
     fi
     
     rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
@@ -4583,32 +4612,50 @@ EOF
 
 # SOCKS5 服务端配置
 gen_socks_server_config() {
-    local username="$1" password="$2" port="$3"
+    local username="$1" password="$2" port="$3" use_tls="${4:-false}" sni="${5:-}"
     mkdir -p "$CFG"
 
-    register_protocol "socks" "$(build_config username "$username" password "$password" port "$port")"
+    # 构建配置 JSON
+    local config_json=""
+    if [[ "$use_tls" == "true" ]]; then
+        config_json=$(build_config username "$username" password "$password" port "$port" tls "true" sni "$sni")
+    else
+        config_json=$(build_config username "$username" password "$password" port "$port")
+    fi
+    register_protocol "socks" "$config_json"
     
-    # SOCKS5 的 join 信息比较特殊，需要两种链接格式
+    # SOCKS5 的 join 信息
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
+    local tls_suffix=""
+    [[ "$use_tls" == "true" ]] && tls_suffix="-TLS"
+    
     > "$CFG/socks.join"
     if [[ -n "$ipv4" ]]; then
-        local data="SOCKS|$ipv4|$port|$username|$password"
+        local data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password"
+        [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|$ipv4|$port|$username|$password|$sni"
         local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local tg_link=$(gen_socks_link "$ipv4" "$port" "$username" "$password")
-        local socks_link="socks5://${username}:${password}@${ipv4}:${port}#SOCKS5-${ipv4}"
+        local socks_link
+        if [[ "$use_tls" == "true" ]]; then
+            socks_link="socks5://${username}:${password}@${ipv4}:${port}?tls=true&sni=${sni}#SOCKS5-TLS-${ipv4}"
+        else
+            socks_link="socks5://${username}:${password}@${ipv4}:${port}#SOCKS5-${ipv4}"
+        fi
         printf '%s\n' "# IPv4" >> "$CFG/socks.join"
         printf '%s\n' "JOIN_V4=$code" >> "$CFG/socks.join"
-        printf '%s\n' "SOCKS_V4=$tg_link" >> "$CFG/socks.join"
         printf '%s\n' "SOCKS5_V4=$socks_link" >> "$CFG/socks.join"
     fi
     if [[ -n "$ipv6" ]]; then
-        local data="SOCKS|[$ipv6]|$port|$username|$password"
+        local data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password"
+        [[ "$use_tls" == "true" ]] && data="SOCKS${tls_suffix}|[$ipv6]|$port|$username|$password|$sni"
         local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        local tg_link="https://t.me/socks?server=[$ipv6]&port=${port}&user=${username}&pass=${password}"
-        local socks_link="socks5://${username}:${password}@[$ipv6]:${port}#SOCKS5-[$ipv6]"
+        local socks_link
+        if [[ "$use_tls" == "true" ]]; then
+            socks_link="socks5://${username}:${password}@[$ipv6]:${port}?tls=true&sni=${sni}#SOCKS5-TLS-[$ipv6]"
+        else
+            socks_link="socks5://${username}:${password}@[$ipv6]:${port}#SOCKS5-[$ipv6]"
+        fi
         printf '%s\n' "# IPv6" >> "$CFG/socks.join"
         printf '%s\n' "JOIN_V6=$code" >> "$CFG/socks.join"
-        printf '%s\n' "SOCKS_V6=$tg_link" >> "$CFG/socks.join"
         printf '%s\n' "SOCKS5_V6=$socks_link" >> "$CFG/socks.join"
     fi
     echo "server" > "$CFG/role"
@@ -8628,11 +8675,10 @@ manage_routing() {
         
         _item "1" "WARP 管理"
         _item "2" "链式代理"
-        _item "3" "快速配置代理出口"
-        _item "4" "配置分流规则"
-        _item "5" "直连出口设置"
-        _item "6" "测试分流效果"
-        _item "7" "查看当前配置"
+        _item "3" "配置分流规则"
+        _item "4" "直连出口设置"
+        _item "5" "测试分流效果"
+        _item "6" "查看当前配置"
         _item "0" "返回"
         _line
         
@@ -8641,16 +8687,15 @@ manage_routing() {
         case "$choice" in
             1) manage_warp ;;
             2) manage_chain_proxy ;;
-            3) add_quick_proxy ;;
-            4) configure_routing_rules ;;
-            5) configure_direct_outbound ;;
-            6)
+            3) configure_routing_rules ;;
+            4) configure_direct_outbound ;;
+            5)
                 _header
                 echo -e "  ${W}测试分流效果${NC}"
                 test_routing
                 _pause
                 ;;
-            7)
+            6)
                 _header
                 echo -e "  ${W}当前分流配置${NC}"
                 _line
@@ -8666,151 +8711,6 @@ manage_routing() {
             0) return ;;
         esac
     done
-}
-
-# 快速配置代理出口 (SOCKS5/HTTP/SS)
-add_quick_proxy() {
-    _header
-    echo -e "  ${W}快速配置代理出口${NC}"
-    _line
-    echo -e "  ${D}直接输入代理服务器信息，无需分享链接${NC}"
-    echo ""
-    
-    _item "1" "SOCKS5 代理"
-    _item "2" "HTTP 代理"
-    _item "3" "Shadowsocks (SS)"
-    _item "0" "返回"
-    _line
-    
-    read -rp "  请选择代理类型: " proxy_type
-    
-    local type="" name="" server="" port="" username="" password="" method=""
-    
-    case "$proxy_type" in
-        1) type="socks"; name="SOCKS5" ;;
-        2) type="http"; name="HTTP" ;;
-        3) type="shadowsocks"; name="SS" ;;
-        0|"") return ;;
-        *) _warn "无效选项"; return ;;
-    esac
-    
-    echo ""
-    echo -e "  ${Y}配置 ${name} 代理${NC}"
-    _line
-    
-    # 输入服务器地址
-    read -rp "  服务器地址: " server
-    server=$(echo "$server" | tr -d ' \t')
-    [[ -z "$server" ]] && { _warn "服务器地址不能为空"; return; }
-    
-    # 输入端口
-    read -rp "  端口 [1080]: " port
-    port=$(echo "$port" | tr -d ' \t')
-    [[ -z "$port" ]] && port="1080"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
-        _warn "端口无效"; return
-    fi
-    
-    # SS 需要加密方式和密码
-    if [[ "$type" == "shadowsocks" ]]; then
-        echo ""
-        echo -e "  ${D}加密方式:${NC}"
-        echo -e "  ${D}1) aes-256-gcm  2) aes-128-gcm  3) chacha20-ietf-poly1305${NC}"
-        echo -e "  ${D}4) 2022-blake3-aes-256-gcm  5) 2022-blake3-aes-128-gcm${NC}"
-        read -rp "  选择加密方式 [1]: " method_choice
-        case "$method_choice" in
-            2) method="aes-128-gcm" ;;
-            3) method="chacha20-ietf-poly1305" ;;
-            4) method="2022-blake3-aes-256-gcm" ;;
-            5) method="2022-blake3-aes-128-gcm" ;;
-            *) method="aes-256-gcm" ;;
-        esac
-        
-        read -rp "  密码: " password
-        [[ -z "$password" ]] && { _warn "密码不能为空"; return; }
-    else
-        # SOCKS5/HTTP 可选用户名密码
-        echo ""
-        echo -e "  ${D}认证信息 (可选，直接回车跳过)${NC}"
-        read -rp "  用户名: " username
-        if [[ -n "$username" ]]; then
-            read -rp "  密码: " password
-        fi
-    fi
-    
-    # 生成节点名称
-    local node_name="${name}-${server}:${port}"
-    
-    # 构建节点 JSON
-    local node_json=""
-    if [[ "$type" == "shadowsocks" ]]; then
-        node_json=$(jq -n \
-            --arg name "$node_name" \
-            --arg type "$type" \
-            --arg server "$server" \
-            --argjson port "$port" \
-            --arg method "$method" \
-            --arg password "$password" \
-            '{name:$name,type:$type,server:$server,port:$port,method:$method,password:$password}')
-    elif [[ -n "$username" ]]; then
-        node_json=$(jq -n \
-            --arg name "$node_name" \
-            --arg type "$type" \
-            --arg server "$server" \
-            --argjson port "$port" \
-            --arg username "$username" \
-            --arg password "$password" \
-            '{name:$name,type:$type,server:$server,port:$port,username:$username,password:$password}')
-    else
-        node_json=$(jq -n \
-            --arg name "$node_name" \
-            --arg type "$type" \
-            --arg server "$server" \
-            --argjson port "$port" \
-            '{name:$name,type:$type,server:$server,port:$port}')
-    fi
-    
-    # 检查是否已存在同名节点
-    if db_chain_node_exists "$node_name"; then
-        read -rp "  节点已存在，是否覆盖? [y/N]: " overwrite
-        if [[ "$overwrite" =~ ^[Yy]$ ]]; then
-            db_del_chain_node "$node_name"
-        else
-            return
-        fi
-    fi
-    
-    # 保存节点
-    if db_add_chain_node "$node_json"; then
-        _ok "代理节点已添加: $node_name"
-        
-        # 询问是否立即启用
-        read -rp "  是否立即启用此节点作为分流出口? [Y/n]: " enable_now
-        if [[ ! "$enable_now" =~ ^[Nn]$ ]]; then
-            db_set_chain_active "$node_name"
-            _ok "已启用节点: $node_name"
-            
-            # 询问是否配置分流规则
-            local rules=$(db_get_routing_rules)
-            if [[ -z "$rules" || "$rules" == "[]" ]]; then
-                echo ""
-                read -rp "  是否现在配置分流规则? [Y/n]: " config_rules
-                if [[ ! "$config_rules" =~ ^[Nn]$ ]]; then
-                    configure_routing_rules
-                    return
-                fi
-            else
-                # 已有分流规则，更新配置
-                _info "更新代理配置..."
-                _regenerate_proxy_configs
-                _ok "配置已更新"
-            fi
-        fi
-    else
-        _err "添加节点失败"
-    fi
-    
-    _pause
 }
 
 
@@ -8976,12 +8876,100 @@ _parse_hostport() {
     echo "${host}|${port}"
 }
 
-# 解析代理链接 (支持 ss/vmess/vless/trojan)
+# 解析代理链接 (支持 ss/vmess/vless/trojan/socks/naive)
 parse_proxy_link() {
     local link="$1"
     local result=""
     
     case "$link" in
+        socks://*|socks5://*)
+            # SOCKS5 格式: socks://[user:pass@]host:port#name 或 socks5://...
+            local content="${link#socks://}"
+            content="${content#socks5://}"
+            local name="" host="" port="" username="" password="" hostport=""
+            
+            # 提取名称
+            [[ "$content" == *"#"* ]] && { name=$(urldecode "$(echo "$content" | sed 's/.*#//')"); content="${content%%#*}"; }
+            
+            # 移除查询参数
+            content="${content%%\?*}"
+            
+            # 检查是否有认证信息
+            if [[ "$content" == *"@"* ]]; then
+                local userinfo="${content%%@*}"
+                hostport="${content#*@}"
+                username="${userinfo%%:*}"
+                password="${userinfo#*:}"
+                # URL 解码
+                username=$(urldecode "$username")
+                password=$(urldecode "$password")
+            else
+                hostport="$content"
+            fi
+            
+            # 解析 host:port
+            local parsed=$(_parse_hostport "$hostport")
+            host="${parsed%%|*}"
+            port="${parsed##*|}"
+            
+            # 确保 port 是纯数字
+            port=$(echo "$port" | tr -d '"' | tr -d ' ')
+            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            
+            [[ -z "$name" ]] && name="SOCKS5-${host}:${port}"
+            if [[ -n "$host" && -n "$port" ]]; then
+                if [[ -n "$username" ]]; then
+                    result=$(jq -nc \
+                        --arg name "$name" --arg host "$host" --argjson port "$port" \
+                        --arg username "$username" --arg password "$password" \
+                        '{name:$name,type:"socks",server:$host,port:$port,username:$username,password:$password}')
+                else
+                    result=$(jq -nc \
+                        --arg name "$name" --arg host "$host" --argjson port "$port" \
+                        '{name:$name,type:"socks",server:$host,port:$port}')
+                fi
+            fi
+            ;;
+        naive+https://*|naiveproxy://*)
+            # NaiveProxy 格式: naive+https://user:pass@host:port#name
+            local content="${link#naive+https://}"
+            content="${content#naiveproxy://}"
+            local name="" host="" port="" username="" password="" hostport=""
+            
+            # 提取名称
+            [[ "$content" == *"#"* ]] && { name=$(urldecode "$(echo "$content" | sed 's/.*#//')"); content="${content%%#*}"; }
+            
+            # 移除查询参数
+            content="${content%%\?*}"
+            
+            # 解析认证信息
+            if [[ "$content" == *"@"* ]]; then
+                local userinfo="${content%%@*}"
+                hostport="${content#*@}"
+                username="${userinfo%%:*}"
+                password="${userinfo#*:}"
+                # URL 解码
+                username=$(urldecode "$username")
+                password=$(urldecode "$password")
+            else
+                return 1  # NaiveProxy 必须有认证信息
+            fi
+            
+            # 解析 host:port
+            local parsed=$(_parse_hostport "$hostport")
+            host="${parsed%%|*}"
+            port="${parsed##*|}"
+            
+            # 确保 port 是纯数字
+            port=$(echo "$port" | tr -d '"' | tr -d ' ')
+            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            
+            [[ -z "$name" ]] && name="Naive-${host}:${port}"
+            [[ -n "$host" && -n "$port" && -n "$username" && -n "$password" ]] && result=$(jq -nc \
+                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg username "$username" --arg password "$password" \
+                '{name:$name,type:"naive",server:$host,port:$port,username:$username,password:$password}')
+            ;;
         ss://*)
             # SS 格式: 
             # 1. ss://base64(method:password)@host:port?params#name (SIP002 格式)
@@ -9373,6 +9361,13 @@ gen_xray_chain_outbound() {
                 echo "$base_out"
             fi
             ;;
+        naive)
+            # NaiveProxy 使用 HTTP/2 协议，Xray 不原生支持，需要通过 HTTP 代理模拟
+            # 实际上 Xray 无法直接作为 NaiveProxy 客户端，这里返回空
+            # 如果需要支持 NaiveProxy 链式代理，建议使用 Sing-box
+            _warn "Xray 不支持 NaiveProxy 链式代理，请使用 Sing-box 协议 (如 HY2/TUIC)" >&2
+            return 1
+            ;;
     esac
 }
 
@@ -9492,6 +9487,15 @@ gen_singbox_chain_outbound() {
             [[ "$insecure" == "1" ]] && base=$(echo "$base" | jq '.tls.insecure=true')
             echo "$base"
             ;;
+        naive)
+            # NaiveProxy (HTTP/2 代理)
+            local username=$(echo "$node" | jq -r '.username')
+            local password=$(echo "$node" | jq -r '.password')
+            
+            jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg user "$username" --arg pass "$password" --arg ds "$domain_strategy" \
+                '{tag:$tag,type:"naive",server:$server,server_port:$port,username:$user,password:$pass,tls:{enabled:true,server_name:$server},domain_strategy:$ds}'
+            ;;
     esac
 }
 
@@ -9500,7 +9504,7 @@ _add_chain_node_interactive() {
     _header
     echo -e "  ${W}添加代理节点${NC}"
     _line
-    echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2${NC}"
+    echo -e "  ${D}支持: ss/vmess/vless/trojan/hysteria2/socks5/naive${NC}"
     echo ""
     
     echo -e "  ${Y}粘贴代理链接:${NC}"
@@ -9569,7 +9573,7 @@ _add_chain_node_interactive() {
         echo ""
         read -rp "  是否立即将此节点用于分流? [y/N]: " use_now
         if [[ "$use_now" =~ ^[Yy]$ ]]; then
-            configure_routing_rules
+            _add_routing_rule
             return
         fi
     else
@@ -10650,14 +10654,37 @@ show_single_protocol_info() {
             echo -e "  ${C}${country_code}-TUIC = TUIC, ${config_ip}, ${display_port}, \"${password}\", \"${uuid}\", udp=true, sni=${sni}, skip-cert-verify=true, alpn=h3${NC}"
             ;;
         socks)
+            local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
+            local socks_sni=$(echo "$cfg" | jq -r '.sni // ""')
             echo -e "  用户名: ${G}$username${NC}"
             echo -e "  密码: ${G}$password${NC}"
-            echo ""
-            echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-SOCKS5 = socks5, ${config_ip}, ${display_port}, ${username}, ${password}${NC}"
-            echo ""
-            echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-SOCKS5 = socks5, ${config_ip}, ${display_port}, ${username}, \"${password}\", udp=true${NC}"
+            if [[ "$use_tls" == "true" ]]; then
+                echo -e "  TLS: ${G}启用${NC} (SNI: $socks_sni)"
+                echo ""
+                echo -e "  ${Y}Surge 配置:${NC}"
+                echo -e "  ${C}${country_code}-SOCKS5-TLS = socks5-tls, ${config_ip}, ${display_port}, ${username}, ${password}, skip-cert-verify=true, sni=${socks_sni}${NC}"
+                echo ""
+                echo -e "  ${Y}Clash 配置:${NC}"
+                echo -e "  ${C}- name: ${country_code}-SOCKS5-TLS${NC}"
+                echo -e "  ${C}  type: socks5${NC}"
+                echo -e "  ${C}  server: ${config_ip}${NC}"
+                echo -e "  ${C}  port: ${display_port}${NC}"
+                echo -e "  ${C}  username: ${username}${NC}"
+                echo -e "  ${C}  password: ${password}${NC}"
+                echo -e "  ${C}  tls: true${NC}"
+                echo -e "  ${C}  skip-cert-verify: true${NC}"
+            else
+                echo -e "  TLS: ${D}未启用${NC}"
+                echo ""
+                echo -e "  ${Y}Telegram 代理链接:${NC}"
+                echo -e "  ${C}https://t.me/socks?server=${config_ip}&port=${display_port}&user=${username}&pass=${password}${NC}"
+                echo ""
+                echo -e "  ${Y}Surge 配置:${NC}"
+                echo -e "  ${C}${country_code}-SOCKS5 = socks5, ${config_ip}, ${display_port}, ${username}, ${password}${NC}"
+                echo ""
+                echo -e "  ${Y}Loon 配置:${NC}"
+                echo -e "  ${C}${country_code}-SOCKS5 = socks5, ${config_ip}, ${display_port}, ${username}, \"${password}\", udp=true${NC}"
+            fi
             ;;
     esac
     
@@ -10749,8 +10776,15 @@ show_single_protocol_info() {
                 join_code=$(echo "NAIVE|${domain}|${link_port}|${username}|${password}" | base64 -w 0)
                 ;;
             socks)
-                link=$(gen_socks_link "$ip_addr" "$link_port" "$username" "$password" "$country_code")
-                join_code=$(echo "SOCKS|${ip_addr}|${link_port}|${username}|${password}" | base64 -w 0)
+                local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
+                local socks_sni=$(echo "$cfg" | jq -r '.sni // ""')
+                if [[ "$use_tls" == "true" ]]; then
+                    link="socks5://${username}:${password}@${ip_addr}:${link_port}?tls=true&sni=${socks_sni}#SOCKS5-TLS-${ip_addr}"
+                    join_code=$(echo "SOCKS-TLS|${ip_addr}|${link_port}|${username}|${password}|${socks_sni}" | base64 -w 0)
+                else
+                    link=$(gen_socks_link "$ip_addr" "$link_port" "$username" "$password" "$country_code")
+                    join_code=$(echo "SOCKS|${ip_addr}|${link_port}|${username}|${password}" | base64 -w 0)
+                fi
                 ;;
         esac
         
@@ -10764,7 +10798,14 @@ show_single_protocol_info() {
         # ShadowTLS 组合协议只显示 JOIN 码
         if [[ "$protocol" != "snell-shadowtls" && "$protocol" != "snell-v5-shadowtls" && "$protocol" != "ss2022-shadowtls" ]]; then
             if [[ "$protocol" == "socks" ]]; then
-                local socks_link="socks5://${username}:${password}@${ip_addr}:${link_port}#SOCKS5-${ip_addr}"
+                local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
+                local socks_sni=$(echo "$cfg" | jq -r '.sni // ""')
+                local socks_link
+                if [[ "$use_tls" == "true" ]]; then
+                    socks_link="socks5://${username}:${password}@${ip_addr}:${link_port}?tls=true&sni=${socks_sni}#SOCKS5-TLS-${ip_addr}"
+                else
+                    socks_link="socks5://${username}:${password}@${ip_addr}:${link_port}#SOCKS5-${ip_addr}"
+                fi
                 echo -e "  ${C}分享链接:${NC}"
                 echo -e "  ${G}$socks_link${NC}"
                 echo ""
@@ -10878,11 +10919,11 @@ show_single_protocol_info() {
             echo -e "  ${D}提示: 请在主菜单选择「订阅管理」配置订阅服务${NC}"
         fi
     elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-xhttp") ]]; then
-        # Reality 协议，检查是否有真实域名配置（偷自己域名）
+        # Reality 协议，检查是否有真实域名配置
         if [[ -n "$domain" && -f "$CFG/sub.info" ]]; then
             source "$CFG/sub.info"
             
-            # Reality 偷自己域名时，订阅链接用 Nginx 端口 (sub_port)
+            # Reality 真实域名模式时，订阅链接用 Nginx 端口 (sub_port)
             if [[ -n "$sub_port" ]]; then
                 local base_url="https://${sub_domain:-$domain}:${sub_port}/sub/${sub_uuid}"
                 echo -e "  ${Y}Clash/Clash Verge:${NC}"
@@ -11700,7 +11741,7 @@ do_install_server() {
             _line
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
-            # Reality 偷自己域名时，订阅走 Reality 端口，不显示 Nginx 端口
+            # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
             if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
                 echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
             fi
@@ -11734,7 +11775,7 @@ do_install_server() {
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
             echo -e "  Path: ${G}$path${NC}"
-            # Reality 偷自己域名时，订阅走 Reality 端口，不显示 Nginx 端口
+            # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
             if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
                 echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
             fi
@@ -11928,6 +11969,32 @@ do_install_server() {
             ;;
         socks)
             local username=$(gen_password 8) password=$(gen_password)
+            local use_tls="false" sni=""
+            
+            # 询问是否启用 TLS
+            echo ""
+            _line
+            echo -e "  ${W}SOCKS5 安全设置${NC}"
+            _line
+            echo -e "  ${G}1)${NC} 不启用 TLS ${D}(明文传输，可能被 QoS)${NC}"
+            echo -e "  ${G}2)${NC} 启用 TLS ${D}(加密传输，需要证书)${NC}"
+            echo ""
+            read -rp "  请选择 [1]: " tls_choice
+            
+            if [[ "$tls_choice" == "2" ]]; then
+                use_tls="true"
+                # 调用统一的证书配置函数
+                setup_cert_and_nginx "socks"
+                local cert_domain="$CERT_DOMAIN"
+                
+                # 询问 SNI 配置（与其他 TLS 协议一致）
+                sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+                
+                # 如果没有真实证书，使用自签证书（用 SNI 作为 CN）
+                if [[ -z "$cert_domain" ]]; then
+                    gen_self_cert "$sni"
+                fi
+            fi
             
             echo ""
             _line
@@ -11936,6 +12003,11 @@ do_install_server() {
             echo -e "  端口: ${G}$port${NC}"
             echo -e "  用户名: ${G}$username${NC}"
             echo -e "  密码: ${G}$password${NC}"
+            if [[ "$use_tls" == "true" ]]; then
+                echo -e "  TLS: ${G}启用${NC} (SNI: $sni)"
+            else
+                echo -e "  TLS: ${D}未启用${NC}"
+            fi
             _line
             echo ""
             
@@ -11943,7 +12015,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_socks_server_config "$username" "$password" "$port"
+            gen_socks_server_config "$username" "$password" "$port" "$use_tls" "$sni"
             ;;
         ss2022)
             # SS2022 加密方式选择
