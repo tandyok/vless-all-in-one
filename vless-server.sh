@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.10 [服务端]
+#  多协议代理一键部署脚本 v3.4.11 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.10"
+readonly VERSION="3.4.11"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/Zyx0rx/vless-all-in-one"
 readonly SCRIPT_REPO="Zyx0rx/vless-all-in-one"
